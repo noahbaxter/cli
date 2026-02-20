@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 1 ]]; then
+    echo "Usage: ytlist <channel_url>" >&2
+    echo "  e.g. ytlist https://www.youtube.com/@SomeChannel" >&2
+    exit 1
+fi
+
+yt-dlp --flat-playlist --print "%(title)s\t%(url)s" "$1"
