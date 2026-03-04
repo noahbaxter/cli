@@ -1,0 +1,15 @@
+[project]
+name = "cli-tools"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "youtube-transcript-api",
+]
+
+[project.scripts]
+yttext = "cli_tools.yttext:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
