@@ -114,7 +114,6 @@ compress_audio() {
   local final_bitrate=""
   local final_ext=""
   local final_codec=""
-  local final_size_estimate=""
 
   for tier in "${tiers[@]}"; do
     local bitrate="${tier%%:*}"
@@ -123,13 +122,11 @@ compress_audio() {
     local codec="${tier##*:}"
 
     local estimated_size=$(estimate_audio_size "$input_file" "${bitrate%k}")
-    local estimated_mb=$(printf "%.1f" $((estimated_size / 1024 / 1024)))
 
     if [ "$estimated_size" -lt "$TARGET_BYTES" ]; then
       final_bitrate="$bitrate"
       final_ext="$ext"
       final_codec="$codec"
-      final_size_estimate="$estimated_mb"
       break
     fi
   done
@@ -143,25 +140,57 @@ compress_audio() {
       final_ext="mp3"
       final_codec="libmp3lame"
     fi
-    final_size_estimate="?"
     echo -e "  ${YELLOW}⚠ Needs extreme compression (${final_bitrate})${RESET}"
   fi
 
   local output_file=$(get_output_filename "$base_name" "$final_ext" "$extension")
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo -e "  ${CYAN}[DRY-RUN]${RESET} ${final_bitrate} → $(basename $output_file) (${final_size_estimate}MB)"
+    echo -e "  ${CYAN}[DRY-RUN]${RESET} ${final_bitrate} → $(basename $output_file)"
     return
   fi
 
-  ffmpeg -i "$input_file" -vn -ar 44100 -ac 2 -b:a "$final_bitrate" -c:a "$final_codec" "$output_file" -y 2>&1 | tail -1
+  # Encode, then verify actual size — drop a tier if over target
+  local tier_idx=0
+  for tier in "${tiers[@]}"; do
+    tier_idx=$((tier_idx + 1))
+    local b="${tier%%:*}"
+    if [ "$b" = "$final_bitrate" ]; then
+      break
+    fi
+  done
 
-  if [ -f "$output_file" ]; then
-    local shrunk_size=$(du -h "$output_file" | awk '{print $1}')
-    echo -e "  ${GREEN}✓${RESET} ${final_bitrate} → $(basename $output_file) (${shrunk_size})"
-  else
-    echo -e "  ${RED}✗${RESET} Failed to convert audio"
-  fi
+  while true; do
+    ffmpeg -i "$input_file" -vn -ar 44100 -ac 2 -b:a "$final_bitrate" -c:a "$final_codec" "$output_file" -y 2>&1 | tail -1
+
+    if [ ! -f "$output_file" ]; then
+      echo -e "  ${RED}✗${RESET} Failed to convert audio"
+      return
+    fi
+
+    local actual_size=$(stat -f%z "$output_file")
+    if [ "$actual_size" -le "$TARGET_BYTES" ]; then
+      break
+    fi
+
+    # Try next tier down
+    tier_idx=$((tier_idx + 1))
+    if [ "$tier_idx" -gt "${#tiers[@]}" ]; then
+      echo -e "  ${RED}✗${RESET} Could not fit under target even at lowest tier ($(du -h "$output_file" | awk '{print $1}'))"
+      return
+    fi
+
+    local next_tier="${tiers[$tier_idx]}"
+    final_bitrate="${next_tier%%:*}"
+    local next_ext="${next_tier#*:}"
+    final_ext="${next_ext%%:*}"
+    final_codec="${next_tier##*:}"
+    output_file=$(get_output_filename "$base_name" "$final_ext" "$extension")
+    echo -e "  Output too large ($(du -h "$output_file" | awk '{print $1}')), dropping to ${final_bitrate}..."
+  done
+
+  local shrunk_size=$(du -h "$output_file" | awk '{print $1}')
+  echo -e "  ${GREEN}✓${RESET} ${final_bitrate} → $(basename $output_file) (${shrunk_size})"
 }
 
 # Try image compression with quality tiers
@@ -275,16 +304,41 @@ compress_video() {
     return
   fi
 
-  echo -e "  Encoding ${label} (v:${video_bitrate}k a:${audio_bitrate}k)..."
-
   local output_file=$(get_output_filename "$base_name" "mp4" "$extension")
-  ffmpeg -i "$input_file" -vf "scale=${scale}" -preset slow -b:v "${video_bitrate}k" -c:a aac -b:a "${audio_bitrate}k" "$output_file" -y 2>&1 | tail -1
+  local attempt
+  for attempt in 1 2 3; do
+    echo -e "  Encoding ${label} (v:${video_bitrate}k a:${audio_bitrate}k)..."
+    ffmpeg -i "$input_file" -vf "scale=${scale}" -preset slow \
+      -b:v "${video_bitrate}k" -maxrate "${video_bitrate}k" -bufsize "$((video_bitrate * 2))k" \
+      -c:a aac -b:a "${audio_bitrate}k" "$output_file" -y 2>&1 | tail -1
 
-  if [ -f "$output_file" ]; then
-    local shrunk_size=$(du -h "$output_file" | awk '{print $1}')
-    echo -e "  ${GREEN}✓${RESET} ${label} (v:${video_bitrate}k a:${audio_bitrate}k) → $(basename $output_file) (${shrunk_size})"
+    if [ ! -f "$output_file" ]; then
+      echo -e "  ${RED}✗${RESET} Failed to compress video"
+      return
+    fi
+
+    local actual_size=$(stat -f%z "$output_file")
+    if [ "$actual_size" -le "$TARGET_BYTES" ]; then
+      break
+    fi
+
+    if [ "$attempt" -lt 3 ]; then
+      # Scale down proportionally with an extra 5% margin
+      video_bitrate=$((video_bitrate * TARGET_BYTES / actual_size * 95 / 100))
+      if [ "$video_bitrate" -lt 50 ]; then
+        echo -e "  ${RED}✗${RESET} Cannot shrink further"
+        break
+      fi
+      echo -e "  Output too large ($(du -h "$output_file" | awk '{print $1}')), retrying..."
+    fi
+  done
+
+  local actual_size=$(stat -f%z "$output_file")
+  local shrunk_size=$(du -h "$output_file" | awk '{print $1}')
+  if [ "$actual_size" -gt "$TARGET_BYTES" ]; then
+    echo -e "  ${RED}✗${RESET} Could not fit under target after 3 attempts (${shrunk_size})"
   else
-    echo -e "  ${RED}✗${RESET} Failed to compress video"
+    echo -e "  ${GREEN}✓${RESET} ${label} (v:${video_bitrate}k a:${audio_bitrate}k) → $(basename $output_file) (${shrunk_size})"
   fi
 }
 
