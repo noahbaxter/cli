@@ -352,8 +352,8 @@ compress_pdf() {
     return
   fi
 
-  local tiers=("/prepress" "/printer" "/ebook" "/screen")
-  local tier_labels=("prepress" "printer" "ebook" "screen")
+  local tiers=("/ebook" "/screen")
+  local tier_labels=("ebook" "screen")
   local final_tier=""
   local final_label=""
   local final_temp=""
@@ -370,8 +370,12 @@ compress_pdf() {
     local temp_file="/tmp/shrink_pdf_${RANDOM}.pdf"
 
     echo -ne "  Trying ${label}...\r"
-    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS="$tier" \
-       -dNOPAUSE -dQUIET -dBATCH -sOutputFile="$temp_file" "$input_file" 2>/dev/null
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 \
+       -dNOPAUSE -dQUIET -dBATCH \
+       -dPDFSETTINGS="$tier" \
+       -dPassThroughJPEGImages=false \
+       -dPassThroughJPXImages=false \
+       -sOutputFile="$temp_file" "$input_file" 2>/dev/null
 
     local temp_size=$(stat -f%z "$temp_file" 2>/dev/null)
     local temp_mb=$((temp_size / 1024 / 1024))
@@ -379,7 +383,6 @@ compress_pdf() {
     if [ -n "$temp_size" ] && [ "$temp_size" -lt "$TARGET_BYTES" ]; then
       final_tier="$tier"
       final_label="$label"
-      # Keep this temp file as the final output
       final_temp="$temp_file"
       break
     fi
@@ -400,8 +403,12 @@ compress_pdf() {
     mv "$final_temp" "$output_file"
   else
     echo -ne "  Compressing ${final_label}...\r"
-    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 -dPDFSETTINGS="$final_tier" \
-       -dNOPAUSE -dQUIET -dBATCH -sOutputFile="$output_file" "$input_file" 2>/dev/null
+    gs -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 \
+       -dNOPAUSE -dQUIET -dBATCH \
+       -dPDFSETTINGS="$final_tier" \
+       -dPassThroughJPEGImages=false \
+       -dPassThroughJPXImages=false \
+       -sOutputFile="$output_file" "$input_file" 2>/dev/null
   fi
 
   if [ -f "$output_file" ]; then
