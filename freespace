@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+"""Scan for disk space bloat on macOS dev machines. Reports what's taking space — never deletes anything."""
+
+import argparse
+import concurrent.futures
+import json
+import os
+import shutil
+import sys
+from collections import defaultdict
+from dataclasses import dataclass, field
+from enum import Enum
+
+
+# ── Data Model ──────────────────────────────────────────────────────────────────
+
+
+class Category(Enum):
+    PACKAGE_CACHES = "Package Caches"
+    BUILD_ARTIFACTS = "Build Artifacts"
+    APP_CACHES = "App Caches"
+    DOWNLOADS = "Downloads & Media"
+    CONTAINERS = "Containers"
+    LOGS = "Logs"
+    LARGE_FILES = "Large Files"
+
+
+class Safety(Enum):
+    SAFE = "safe"
+    MODERATE = "moderate"
+    RISKY = "risky"
+
+
+@dataclass
+class BloatTarget:
+    name: str
+    path: str
+    category: Category
+    safety: Safety
+    scan_children: bool = False
+    child_pattern: str = ""
+    max_depth: int = 3
+    scan_bases: list[str] = field(default_factory=list)
+    breakdown: bool = False  # show top children ranked by size
+    breakdown_limit: int = 10
+
+
+@dataclass
+class ScanResult:
+    name: str
+    path: str
+    category: Category
+    safety: Safety
+    size_bytes: int
+    count: int = 1
+    note: str = ""
+    children: list["ScanResult"] = field(default_factory=list)
+
+
+# ── Registry ────────────────────────────────────────────────────────────────────
+
+CODE_DIRS = ["~/Code", "~/Projects", "~/Developer", "~/src", "~/repos", "~/dev", "~/workspace"]
+
+TARGETS: list[BloatTarget] = [
+    # Package Caches
+    BloatTarget("npm cache", "~/.npm", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("yarn cache", "~/Library/Caches/Yarn", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("pnpm store", "~/Library/pnpm/store", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("pip cache", "~/Library/Caches/pip", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("brew cache", "~/Library/Caches/Homebrew", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("conda pkgs", "~/.conda/pkgs", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("cargo registry", "~/.cargo/registry", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("cargo git", "~/.cargo/git", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("go module cache", "~/go/pkg/mod", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("gradle cache", "~/.gradle/caches", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("maven cache", "~/.m2/repository", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("cocoapods cache", "~/Library/Caches/CocoaPods", Category.PACKAGE_CACHES, Safety.SAFE),
+    BloatTarget("uv cache", "~/Library/Caches/uv", Category.PACKAGE_CACHES, Safety.SAFE),
+    # Build Artifacts
+    BloatTarget("node_modules", "", Category.BUILD_ARTIFACTS, Safety.MODERATE,
+                scan_children=True, child_pattern="node_modules", max_depth=3, scan_bases=CODE_DIRS),
+    BloatTarget("Xcode DerivedData", "~/Library/Developer/Xcode/DerivedData", Category.BUILD_ARTIFACTS, Safety.SAFE),
+    BloatTarget("Xcode Archives", "~/Library/Developer/Xcode/Archives", Category.BUILD_ARTIFACTS, Safety.MODERATE),
+    BloatTarget("iOS DeviceSupport", "~/Library/Developer/Xcode/iOS DeviceSupport", Category.BUILD_ARTIFACTS, Safety.SAFE),
+    BloatTarget("SPM SourcePackages", "~/Library/Developer/Xcode/DerivedData/SourcePackages", Category.BUILD_ARTIFACTS, Safety.SAFE),
+    BloatTarget(".venv", "", Category.BUILD_ARTIFACTS, Safety.MODERATE,
+                scan_children=True, child_pattern=".venv", max_depth=3, scan_bases=CODE_DIRS),
+    BloatTarget("__pycache__", "", Category.BUILD_ARTIFACTS, Safety.SAFE,
+                scan_children=True, child_pattern="__pycache__", max_depth=3, scan_bases=CODE_DIRS),
+    BloatTarget(".pytest_cache", "", Category.BUILD_ARTIFACTS, Safety.SAFE,
+                scan_children=True, child_pattern=".pytest_cache", max_depth=3, scan_bases=CODE_DIRS),
+    BloatTarget("CoreSimulator", "~/Library/Developer/CoreSimulator/Devices", Category.BUILD_ARTIFACTS, Safety.SAFE),
+    # App Caches
+    BloatTarget("Spotify cache", "~/Library/Caches/com.spotify.client", Category.APP_CACHES, Safety.SAFE),
+    BloatTarget("Chrome cache", "~/Library/Caches/Google/Chrome", Category.APP_CACHES, Safety.SAFE),
+    BloatTarget("Firefox cache", "~/Library/Caches/Firefox", Category.APP_CACHES, Safety.SAFE),
+    BloatTarget("Slack cache", "~/Library/Caches/com.tinyspeck.slackmacgap", Category.APP_CACHES, Safety.SAFE),
+    BloatTarget("Discord cache", "~/Library/Caches/com.hnc.Discord", Category.APP_CACHES, Safety.SAFE),
+    BloatTarget("Claude cache", "~/Library/Caches/com.anthropic.claudefordesktop", Category.APP_CACHES, Safety.SAFE),
+    BloatTarget("Application Support", "~/Library/Application Support", Category.APP_CACHES, Safety.MODERATE,
+                breakdown=True, breakdown_limit=10),
+    # Downloads & Media
+    BloatTarget("Downloads", "~/Downloads", Category.DOWNLOADS, Safety.RISKY, breakdown=True),
+    BloatTarget("Desktop", "~/Desktop", Category.DOWNLOADS, Safety.RISKY, breakdown=True),
+    BloatTarget("Trash", "~/.Trash", Category.DOWNLOADS, Safety.SAFE, breakdown=True),
+    # Containers
+    BloatTarget("Docker", "~/Library/Containers/com.docker.docker/Data", Category.CONTAINERS, Safety.MODERATE),
+    # Installed
+    BloatTarget("Homebrew cellar", "/opt/homebrew/Cellar", Category.PACKAGE_CACHES, Safety.MODERATE),
+    # Logs
+    BloatTarget("system logs", "~/Library/Logs", Category.LOGS, Safety.SAFE, breakdown=True, breakdown_limit=5),
+]
+
+
+# ── Scanner ─────────────────────────────────────────────────────────────────────
+
+
+def dir_size(path: str) -> int:
+    total = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                    elif entry.is_dir(follow_symlinks=False):
+                        total += dir_size(entry.path)
+                except (PermissionError, OSError):
+                    pass
+    except (PermissionError, OSError):
+        pass
+    return total
+
+
+def find_children(base: str, pattern: str, max_depth: int) -> list[str]:
+    found: list[str] = []
+    base = os.path.expanduser(base)
+    if not os.path.isdir(base):
+        return found
+    _walk_children(base, pattern, max_depth, 0, found)
+    return found
+
+
+def _walk_children(current: str, pattern: str, max_depth: int, depth: int, found: list[str]) -> None:
+    if depth > max_depth:
+        return
+    try:
+        with os.scandir(current) as entries:
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.name == pattern:
+                    found.append(entry.path)
+                elif not entry.name.startswith("."):
+                    _walk_children(entry.path, pattern, max_depth, depth + 1, found)
+    except (PermissionError, OSError):
+        pass
+
+
+def entry_sizes(path: str) -> list[tuple[str, int]]:
+    """Return (name, size) for each direct child of path, sorted by size desc."""
+    entries: list[tuple[str, int]] = []
+    try:
+        with os.scandir(path) as it:
+            for entry in it:
+                try:
+                    if entry.is_file(follow_symlinks=False):
+                        entries.append((entry.name, entry.stat(follow_symlinks=False).st_size))
+                    elif entry.is_dir(follow_symlinks=False):
+                        entries.append((entry.name, dir_size(entry.path)))
+                except (PermissionError, OSError):
+                    pass
+    except (PermissionError, OSError):
+        pass
+    entries.sort(key=lambda e: e[1], reverse=True)
+    return entries
+
+
+def scan_target(target: BloatTarget) -> ScanResult | None:
+    if target.scan_children:
+        all_found: list[str] = []
+        for base in target.scan_bases:
+            all_found.extend(find_children(base, target.child_pattern, target.max_depth))
+        if not all_found:
+            return None
+        total = sum(dir_size(p) for p in all_found)
+        if total == 0:
+            return None
+        return ScanResult(
+            name=f"{target.name} ({len(all_found)})",
+            path="various",
+            category=target.category,
+            safety=target.safety,
+            size_bytes=total,
+            count=len(all_found),
+        )
+
+    path = os.path.expanduser(target.path)
+    if not os.path.exists(path):
+        return None
+
+    children: list[ScanResult] = []
+    if target.breakdown and os.path.isdir(path):
+        # Size children once, derive parent total from that — no double walk
+        child_entries = entry_sizes(path)
+        size = sum(s for _, s in child_entries)
+        if size == 0:
+            return None
+        for child_name, child_size in child_entries[:target.breakdown_limit]:
+            if child_size == 0:
+                continue
+            children.append(ScanResult(
+                name=child_name,
+                path=os.path.join(target.path, child_name),
+                category=target.category,
+                safety=target.safety,
+                size_bytes=child_size,
+            ))
+        shown_size = sum(c.size_bytes for c in children)
+        remaining = size - shown_size
+        if remaining > 0 and len(child_entries) > target.breakdown_limit:
+            other_count = len(child_entries) - target.breakdown_limit
+            children.append(ScanResult(
+                name=f"({other_count} more)",
+                path="",
+                category=target.category,
+                safety=target.safety,
+                size_bytes=remaining,
+            ))
+    else:
+        size = os.path.getsize(path) if os.path.isfile(path) else dir_size(path)
+        if size == 0:
+            return None
+
+    return ScanResult(
+        name=target.name,
+        path=target.path,
+        category=target.category,
+        safety=target.safety,
+        size_bytes=size,
+        children=children,
+    )
+
+
+def scan_all(targets: list[BloatTarget]) -> list[ScanResult]:
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        futures = [pool.submit(scan_target, t) for t in targets]
+        results = [
+            r for f in concurrent.futures.as_completed(futures)
+            if (r := f.result()) is not None
+        ]
+    results.sort(key=lambda r: r.size_bytes, reverse=True)
+    return results
+
+
+def scan_overview() -> list[tuple[str, int]]:
+    """Scan top-level dirs in $HOME plus system paths, return (display_name, size_bytes) sorted desc."""
+    home = os.path.expanduser("~")
+    entries: list[tuple[str, str]] = []  # (display_name, abs_path)
+
+    # Home children
+    try:
+        with os.scandir(home) as it:
+            for entry in it:
+                if entry.is_dir(follow_symlinks=False):
+                    entries.append((f"~/{entry.name}", entry.path))
+    except (PermissionError, OSError):
+        pass
+
+    # System paths
+    for sp in ["/Applications", "/opt/homebrew", "/Library", "/usr/local"]:
+        if os.path.isdir(sp):
+            entries.append((sp, sp))
+
+    # Size them in parallel
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        futures = {pool.submit(dir_size, path): name for name, path in entries}
+        results: list[tuple[str, int]] = []
+        for f in concurrent.futures.as_completed(futures):
+            name = futures[f]
+            size = f.result()
+            if size >= 100 * 1024 * 1024:  # >= 100MB
+                results.append((name, size))
+
+    results.sort(key=lambda e: e[1], reverse=True)
+    return results
+
+
+def get_disk_usage() -> tuple[int, int]:
+    usage = shutil.disk_usage("/")
+    return usage.used, usage.total
+
+
+# ── Deep Scan ───────────────────────────────────────────────────────────────────
+
+EXTENSION_LABELS = {
+    ".dmg": "disk image", ".iso": "disk image", ".img": "disk image",
+    ".pkg": "installer", ".zip": "archive", ".tar": "archive",
+    ".gz": "archive", ".tgz": "archive", ".bz2": "archive",
+    ".xz": "archive", ".rar": "archive", ".7z": "archive",
+    ".log": "log file", ".crash": "crash report", ".core": "core dump",
+    ".ipa": "iOS app archive",
+}
+
+SKIP_DIRS = {
+    ".npm", ".cargo", ".gradle", ".m2", ".conda", ".Trash",
+    "node_modules", "__pycache__", ".git", "DerivedData",
+    "Library", ".venv", "venv", ".pyenv", ".nvm", ".rustup",
+}
+
+
+def deep_scan(threshold_bytes: int = 100 * 1024 * 1024) -> list[ScanResult]:
+    home = os.path.expanduser("~")
+    results: list[ScanResult] = []
+    for dirpath, dirnames, filenames in os.walk(home):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+        for fname in filenames:
+            filepath = os.path.join(dirpath, fname)
+            try:
+                size = os.stat(filepath).st_size
+                if size < threshold_bytes:
+                    continue
+            except (PermissionError, OSError):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            results.append(ScanResult(
+                name=fname if len(fname) <= 30 else fname[:27] + "...",
+                path=filepath.replace(home, "~"),
+                category=Category.LARGE_FILES,
+                safety=Safety.RISKY,
+                size_bytes=size,
+                note=EXTENSION_LABELS.get(ext, ""),
+            ))
+    results.sort(key=lambda r: r.size_bytes, reverse=True)
+    return results
+
+
+# ── Formatters ──────────────────────────────────────────────────────────────────
+
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+CYAN = "\033[36m"
+RESET = "\033[0m"
+
+
+def _use_color(force_no_color: bool) -> bool:
+    if force_no_color or os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+
+def human_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        size_bytes /= 1024
+        if size_bytes < 1024 or unit == "TB":
+            if size_bytes >= 100:
+                return f"{size_bytes:.0f} {unit}"
+            elif size_bytes >= 10:
+                return f"{size_bytes:.1f} {unit}"
+            else:
+                return f"{size_bytes:.2f} {unit}"
+    return f"{size_bytes:.1f} TB"
+
+
+def _safety_label(safety: Safety, color: bool) -> str:
+    label = f"[{safety.value}]"
+    if not color:
+        return label
+    colors = {Safety.SAFE: GREEN, Safety.MODERATE: YELLOW, Safety.RISKY: RED}
+    return f"{colors[safety]}{label}{RESET}"
+
+
+def _bar(fraction: float, width: int = 20) -> str:
+    """Render a proportional bar using eighth-block characters."""
+    blocks = "▏▎▍▌▋▊▉█"
+    full_blocks = int(fraction * width)
+    remainder = (fraction * width) - full_blocks
+    bar = "█" * full_blocks
+    eighth = int(remainder * 8)
+    if eighth > 0 and full_blocks < width:
+        bar += blocks[eighth - 1]
+    return bar
+
+
+def format_table(results: list[ScanResult], used: int, total: int, no_color: bool = False,
+                 overview: list[tuple[str, int]] | None = None) -> str:
+    color = _use_color(no_color)
+    lines: list[str] = []
+
+    # Disk header
+    pct = (used / total) * 100 if total > 0 else 0
+    header = f"Disk: {human_size(used)} used / {human_size(total)} total ({pct:.0f}%)"
+    if color:
+        hcolor = RED if pct > 80 else YELLOW if pct > 60 else GREEN
+        lines.append(f"{hcolor}{BOLD}{header}{RESET}")
+    else:
+        lines.append(header)
+    lines.append("")
+
+    # Overview section
+    if overview:
+        show_limit = 12
+        shown = overview[:show_limit]
+        rest = overview[show_limit:]
+        max_size = shown[0][1] if shown else 1
+
+        section_header = "── Where Space Lives " + "─" * 39
+        if color:
+            lines.append(f"{DIM}{section_header}{RESET}")
+        else:
+            lines.append(section_header)
+
+        for name, size in shown:
+            pct_disk = (size / total) * 100 if total > 0 else 0
+            bar = _bar(size / max_size)
+            size_str = human_size(size)
+            if color:
+                lines.append(f"  {name:<25}{size_str:>10}  {pct_disk:>3.0f}%  {DIM}{bar}{RESET}")
+            else:
+                lines.append(f"  {name:<25}{size_str:>10}  {pct_disk:>3.0f}%  {bar}")
+
+        if rest:
+            # Find threshold: size of last shown entry
+            threshold = shown[-1][1] if shown else 0
+            if color:
+                lines.append(f"  {DIM}({len(rest)} more under {human_size(threshold)}){RESET}")
+            else:
+                lines.append(f"  ({len(rest)} more under {human_size(threshold)})")
+
+        lines.append("")
+
+    # Group by category, sorted by total size
+    grouped: dict[Category, list[ScanResult]] = defaultdict(list)
+    for r in results:
+        grouped[r.category].append(r)
+    cat_order = sorted(grouped, key=lambda c: sum(r.size_bytes for r in grouped[c]), reverse=True)
+
+    for cat in cat_order:
+        items = sorted(grouped[cat], key=lambda r: r.size_bytes, reverse=True)
+        cat_total = human_size(sum(r.size_bytes for r in items))
+
+        if color:
+            lines.append(f"{BOLD}{CYAN}{cat.value:<50}{RESET}{BOLD}{cat_total:>10}{RESET}")
+        else:
+            lines.append(f"{cat.value:<50}{cat_total:>10}")
+
+        for r in items:
+            size_str = human_size(r.size_bytes)
+            safety = _safety_label(r.safety, color)
+            if color:
+                line = f"  {r.name:<20} {DIM}{r.path:<25}{RESET}{size_str:>8}  {safety}"
+            else:
+                line = f"  {r.name:<20} {r.path:<25}{size_str:>8}  {safety}"
+            if r.note:
+                line += f"  {r.note}"
+            lines.append(line)
+
+            for child in r.children:
+                child_size = human_size(child.size_bytes)
+                if color:
+                    lines.append(f"    {DIM}{child.name:<30}{RESET}{child_size:>8}")
+                else:
+                    lines.append(f"    {child.name:<30}{child_size:>8}")
+        lines.append("")
+
+    grand_total = human_size(sum(r.size_bytes for r in results))
+    if color:
+        lines.append(f"{BOLD}Total reclaimable: {grand_total}{RESET}")
+    else:
+        lines.append(f"Total reclaimable: {grand_total}")
+    return "\n".join(lines)
+
+
+def format_json(results: list[ScanResult], used: int, total: int,
+                overview: list[tuple[str, int]] | None = None) -> str:
+    data = {
+        "disk": {
+            "used_bytes": used, "total_bytes": total,
+            "used_human": human_size(used), "total_human": human_size(total),
+        },
+        "total_reclaimable_bytes": sum(r.size_bytes for r in results),
+        "results": [
+            {
+                "name": r.name, "path": r.path, "category": r.category.value,
+                "safety": r.safety.value, "size_bytes": r.size_bytes,
+                "size_human": human_size(r.size_bytes), "count": r.count,
+                "children": [
+                    {"name": c.name, "path": c.path, "size_bytes": c.size_bytes,
+                     "size_human": human_size(c.size_bytes)}
+                    for c in r.children
+                ],
+            }
+            for r in results
+        ],
+    }
+    if overview is not None:
+        data["disk_overview"] = [
+            {
+                "path": name,
+                "size_bytes": size,
+                "size_human": human_size(size),
+                "percent": round((size / total) * 100, 1) if total > 0 else 0,
+            }
+            for name, size in overview
+        ]
+    return json.dumps(data, indent=2)
+
+
+# ── CLI ─────────────────────────────────────────────────────────────────────────
+
+
+def parse_threshold(value: str) -> int:
+    value = value.strip().upper()
+    multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    if value[-1] in multipliers:
+        return int(float(value[:-1]) * multipliers[value[-1]])
+    return int(value)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="freespace", description="Scan for disk space bloat on macOS dev machines")
+    parser.add_argument("--deep", action="store_true", help="also scan $HOME for large files beyond known locations")
+    parser.add_argument("--deep-threshold", default="100M", help="minimum file size for --deep scan (default: 100M)")
+    parser.add_argument("--json", action="store_true", help="output machine-readable JSON")
+    parser.add_argument("--safety", choices=["safe", "moderate", "risky"], help="only show items with this safety level")
+    parser.add_argument("--no-color", action="store_true", help="disable colored output")
+    parser.add_argument("--no-overview", action="store_true", help="skip disk overview scan")
+    args = parser.parse_args()
+
+    # Run overview and bloat scans concurrently
+    overview: list[tuple[str, int]] | None = None
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        bloat_future = pool.submit(scan_all, TARGETS)
+        overview_future = pool.submit(scan_overview) if not args.no_overview else None
+        results = bloat_future.result()
+        if overview_future is not None:
+            overview = overview_future.result()
+
+    if args.deep:
+        results.extend(deep_scan(parse_threshold(args.deep_threshold)))
+        results.sort(key=lambda r: r.size_bytes, reverse=True)
+
+    if args.safety:
+        results = [r for r in results if r.safety == Safety(args.safety)]
+
+    used, total = get_disk_usage()
+
+    if args.json:
+        print(format_json(results, used, total, overview=overview))
+    else:
+        print(format_table(results, used, total, no_color=args.no_color, overview=overview))
+
+
+if __name__ == "__main__":
+    main()
