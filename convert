@@ -1,0 +1,476 @@
+#!/bin/zsh
+# Universal file converter wrapping ffmpeg, magick, and pandoc
+# Usage: convert input.ext output.ext   OR   convert input.ext ext
+#        convert .opus .flac            (batch: cwd)
+#        convert folder/ .opus .flac    (batch: specific dir)
+#        convert -s input.ext output.ext (smaller file, lower quality)
+
+# Color codes
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+CYAN='\033[36m'
+RESET='\033[0m'
+
+die() { echo -e "${RED}error:${RESET} $1" >&2; exit 1; }
+
+show_help() {
+  cat <<'EOF'
+Usage: convert [options] <input> <output|ext>
+       convert [options] <from_ext> <to_ext>
+       convert [options] <dir> <from_ext> <to_ext>
+
+Options:
+  -s, --small   Smaller files, lower quality
+  --crop W:H    Center-crop to aspect ratio (e.g., 1:1, 4:3, 9:16)
+  --cbr         Constant bitrate encoding (video, default)
+  --vbr         Variable bitrate encoding (video)
+  -h, --help    Show this help
+
+Examples:
+  convert input.mp3 output.wav      # explicit output name
+  convert input.mp3 wav             # → input.wav
+  convert input.mp3 .wav            # → input.wav
+  convert .opus .flac               # batch: all .opus → .flac in cwd
+  convert music/ .opus .flac        # batch: all .opus → .flac in music/
+  convert -s input.mp3 output.wav   # smaller file, lower quality
+  convert input.mov mp4              # → CBR H.264 MP4
+  convert input.mov                  # re-encode as CBR → input-cbr.mov
+  convert .mov                       # batch: all .mov → CBR in cwd
+  convert -s input.mov mp4           # CBR, smaller bitrate
+  convert --vbr input.mov mp4        # VBR CRF-based encoding
+  convert --crop 1:1 photo.jpg       # center-crop to square
+  convert --crop 9:16 video.mp4 mp4  # crop to vertical
+
+Supported conversions:
+  audio ↔ audio    (ffmpeg)    wav mp3 flac ogg aac m4a opus wma aiff
+  image ↔ image    (magick)    png jpg webp gif bmp tiff avif heic ico
+  video ↔ video    (ffmpeg)    mp4 mkv mov avi webm flv wmv
+  video → audio    (ffmpeg)
+  image → pdf      (magick)
+  pdf → image      (magick)
+  doc ↔ doc/pdf    (pandoc)    md html docx epub rst txt
+EOF
+  exit 0
+}
+
+# Parse flags
+MAX_QUALITY=1
+RATE_MODE=""
+CROP_W=""
+CROP_H=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--small) MAX_QUALITY=0; shift ;;
+    --cbr) RATE_MODE="cbr"; shift ;;
+    --vbr) RATE_MODE="vbr"; shift ;;
+    --crop)
+      [[ -n "$2" && "$2" == *:* ]] || die "--crop requires W:H format (e.g., 1:1, 4:3, 9:16)"
+      CROP_W="${2%%:*}"; CROP_H="${2##*:}"
+      [[ "$CROP_W" =~ ^[0-9]+$ && "$CROP_H" =~ ^[0-9]+$ && "$CROP_W" -gt 0 && "$CROP_H" -gt 0 ]] \
+        || die "--crop requires positive integers (e.g., 1:1, 4:3, 9:16)"
+      shift 2 ;;
+    -h|--help) show_help ;;
+    -*)  die "unknown flag: $1" ;;
+    *)   POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+# --- Extension/category helpers (needed by both modes) ---
+
+# Classify extensions into categories
+typeset -A EXT_CATEGORY
+for e in wav mp3 flac ogg aac m4a opus wma aiff; do EXT_CATEGORY[$e]="audio"; done
+for e in png jpg webp gif bmp tiff avif heic ico; do EXT_CATEGORY[$e]="image"; done
+for e in mp4 mkv mov avi webm flv wmv; do EXT_CATEGORY[$e]="video"; done
+EXT_CATEGORY[pdf]="pdf"
+for e in md html docx epub rst txt; do EXT_CATEGORY[$e]="doc"; done
+
+# Check if a string looks like an extension (starts with . and rest is a known ext)
+is_ext() {
+  local arg="$1"
+  local ext="${arg#.}"
+  ext="${ext:l}"
+  [[ "$arg" == .* && -n "${EXT_CATEGORY[$ext]}" ]]
+}
+
+# --- Mode detection ---
+
+BATCH_MODE=0
+SAME_FMT=0
+BATCH_DIR=""
+BATCH_FROM_EXT=""
+BATCH_TO_EXT=""
+
+case ${#POSITIONAL[@]} in
+  3)
+    # convert dir/ .from .to
+    [[ -d "${POSITIONAL[1]}" ]] || die "not a directory: ${POSITIONAL[1]}"
+    BATCH_MODE=1
+    BATCH_DIR="${POSITIONAL[1]}"
+    BATCH_FROM_EXT="${POSITIONAL[2]}"
+    BATCH_TO_EXT="${POSITIONAL[3]}"
+    ;;
+  2)
+    if [[ -d "${POSITIONAL[1]}" ]] && is_ext "${POSITIONAL[2]}"; then
+      # convert dir/ .mov
+      BATCH_MODE=1
+      BATCH_DIR="${POSITIONAL[1]}"
+      BATCH_FROM_EXT="${POSITIONAL[2]}"
+      BATCH_TO_EXT="${POSITIONAL[2]}"
+    elif is_ext "${POSITIONAL[1]}" && is_ext "${POSITIONAL[2]}"; then
+      # convert .opus .flac
+      BATCH_MODE=1
+      BATCH_DIR="."
+      BATCH_FROM_EXT="${POSITIONAL[1]}"
+      BATCH_TO_EXT="${POSITIONAL[2]}"
+    else
+      # convert input.mov mp4
+      :
+    fi
+    ;;
+  1)
+    if is_ext "${POSITIONAL[1]}"; then
+      # convert .mov  (batch same format)
+      BATCH_MODE=1
+      BATCH_DIR="."
+      BATCH_FROM_EXT="${POSITIONAL[1]}"
+      BATCH_TO_EXT="${POSITIONAL[1]}"
+    elif [[ -f "${POSITIONAL[1]}" ]]; then
+      # convert input.mov  (re-encode same format)
+      SAME_FMT=1
+    else
+      die "file not found: ${POSITIONAL[1]}"
+    fi
+    ;;
+  *)
+    die "expected: <input> [output|ext]  or  [dir] <from_ext> [to_ext]"
+    ;;
+esac
+
+# --- Shared helpers ---
+
+resolve_output() {
+  local arg="$1"
+  local input_path="$2"
+  local input_dir input_base
+
+  input_dir="$(dirname -- "$input_path")"
+  input_base="$(basename -- "$input_path")"
+  input_base="${input_base%.*}"
+
+  local ext="${arg#.}"
+
+  # Add suffix when re-encoding same format to avoid overwriting
+  if [[ "${ext:l}" == "$(get_ext "$input_path")" ]]; then
+    local in_cat="${EXT_CATEGORY[$(get_ext "$input_path")]}"
+    if [[ -n "$CROP_W" ]]; then
+      input_base="${input_base}-${CROP_W}x${CROP_H}"
+    elif [[ "$in_cat" == "video" ]]; then
+      if [[ "$RATE_MODE" == "vbr" ]]; then
+        input_base="${input_base}-vbr"
+      else
+        input_base="${input_base}-cbr"
+      fi
+    fi
+  fi
+
+  if [[ "$arg" == */* ]]; then
+    echo "$arg"
+    return
+  fi
+
+  if [[ "$arg" == *.* && "$arg" != .* ]]; then
+    echo "${input_dir}/${arg}"
+    return
+  fi
+
+  echo "${input_dir}/${input_base}.${ext}"
+}
+
+get_ext() {
+  local f="$(basename -- "$1")"
+  local ext="${f##*.}"
+  ext="${ext:l}"
+  [[ "$ext" == "jpeg" ]] && ext="jpg"
+  echo "$ext"
+}
+
+require_tool() {
+  command -v "$1" &>/dev/null || die "$1 not found. Install with: brew install $2"
+}
+
+# Calculate center-crop dimensions for target aspect ratio
+# Sets: CALC_CROP_W, CALC_CROP_H
+calc_crop() {
+  local src_w="$1" src_h="$2" target_w="$3" target_h="$4"
+  # Largest rectangle with target ratio that fits in source
+  if (( src_w * target_h > src_h * target_w )); then
+    # Source is wider — crop width
+    CALC_CROP_H=$src_h
+    CALC_CROP_W=$(( src_h * target_w / target_h ))
+  else
+    # Source is taller — crop height
+    CALC_CROP_W=$src_w
+    CALC_CROP_H=$(( src_w * target_h / target_w ))
+  fi
+  # Ensure even dimensions (required by most video codecs)
+  CALC_CROP_W=$(( CALC_CROP_W / 2 * 2 ))
+  CALC_CROP_H=$(( CALC_CROP_H / 2 * 2 ))
+}
+
+# --- Audio codec flags ---
+audio_flags() {
+  local ext="$1"
+  local mq="$2"
+  case "$ext" in
+    mp3)        echo "-c:a libmp3lame -b:a 320k" ;;
+    flac)
+      if [[ "$mq" -eq 1 ]]; then echo "-c:a flac -sample_fmt s32"
+      else echo "-c:a flac"; fi ;;
+    ogg)
+      if [[ "$mq" -eq 1 ]]; then echo "-c:a libvorbis -q:a 10"
+      else echo "-c:a libvorbis -q:a 8"; fi ;;
+    opus)
+      if [[ "$mq" -eq 1 ]]; then echo "-c:a libopus -b:a 512k"
+      else echo "-c:a libopus -b:a 256k"; fi ;;
+    aac|m4a)
+      if [[ "$mq" -eq 1 ]]; then echo "-c:a aac -b:a 512k"
+      else echo "-c:a aac -b:a 256k"; fi ;;
+    wav)
+      if [[ "$mq" -eq 1 ]]; then echo "-c:a pcm_s24le"
+      else echo "-c:a pcm_s16le"; fi ;;
+    aiff)
+      if [[ "$mq" -eq 1 ]]; then echo "-c:a pcm_s24be"
+      else echo "-c:a pcm_s16be"; fi ;;
+    wma)        echo "-c:a wmav2 -b:a 320k" ;;
+  esac
+}
+
+# --- Handler functions ---
+
+convert_audio_audio() {
+  require_tool ffmpeg ffmpeg
+  local flags=(${=:-$(audio_flags "$OUT_EXT" "$MAX_QUALITY")})
+  echo -e "${CYAN}ffmpeg${RESET} → $OUT_EXT"
+  ffmpeg -loglevel warning -stats -i "$INPUT" -vn "${flags[@]}" "$OUTPUT" -y
+}
+
+convert_image_image() {
+  require_tool magick imagemagick
+  local flags=()
+
+  if [[ -n "$CROP_W" ]]; then
+    local dims=$(magick identify -format "%wx%h" "$INPUT")
+    local src_w=${dims%x*} src_h=${dims#*x}
+    calc_crop "$src_w" "$src_h" "$CROP_W" "$CROP_H"
+    flags+=(-gravity center -crop "${CALC_CROP_W}x${CALC_CROP_H}+0+0" +repage)
+  fi
+
+  if [[ "$IN_EXT" == "svg" ]]; then
+    if [[ "$MAX_QUALITY" -eq 1 ]]; then flags+=(-density 600)
+    else flags+=(-density 300); fi
+  fi
+
+  if [[ "$OUT_EXT" == "ico" ]]; then
+    flags+=(-resize "256x256>")
+  fi
+
+  case "$OUT_EXT" in
+    jpg)
+      if [[ "$MAX_QUALITY" -eq 1 ]]; then flags+=(-quality 100)
+      else flags+=(-quality 92); fi ;;
+    webp)
+      if [[ "$MAX_QUALITY" -eq 1 ]]; then flags+=(-quality 100 -define webp:lossless=true)
+      else flags+=(-quality 90); fi ;;
+    avif)
+      if [[ "$MAX_QUALITY" -eq 1 ]]; then flags+=(-quality 100)
+      else flags+=(-quality 80); fi ;;
+  esac
+
+  echo -e "${CYAN}magick${RESET} → $OUT_EXT"
+  magick "$INPUT" "${flags[@]}" "$OUTPUT"
+}
+
+convert_video_video() {
+  require_tool ffmpeg ffmpeg
+
+  local vflags=()
+  case "$OUT_EXT" in
+    webm)
+      if [[ "$MAX_QUALITY" -eq 1 ]]; then vflags=(-c:v libvpx-vp9 -lossless 1)
+      else vflags=(-c:v libvpx-vp9 -crf 30 -b:v 0); fi ;;
+    wmv)
+      if [[ "$MAX_QUALITY" -eq 1 ]]; then vflags=(-c:v wmv2 -b:v 20M)
+      else vflags=(-c:v wmv2 -b:v 5M); fi ;;
+    *)
+      if [[ "$RATE_MODE" == "vbr" ]]; then
+        if [[ "$MAX_QUALITY" -eq 1 ]]; then vflags=(-c:v libx264 -crf 0 -preset veryslow)
+        else vflags=(-c:v libx264 -crf 18 -preset medium); fi
+      else
+        if [[ "$MAX_QUALITY" -eq 1 ]]; then
+          vflags=(-c:v libx264 -b:v 20M -minrate 20M -maxrate 20M -bufsize 40M -preset medium)
+        else
+          vflags=(-c:v libx264 -b:v 8M -minrate 8M -maxrate 8M -bufsize 16M -preset medium)
+        fi
+      fi ;;
+  esac
+
+  local aflags=()
+  case "$OUT_EXT" in
+    mp4|mov|flv) aflags=(-c:a aac -b:a 512k) ;;
+    mkv)         aflags=(-c:a copy) ;;
+    webm)        aflags=(-c:a libopus -b:a 256k) ;;
+    avi)         aflags=(-c:a mp3 -b:a 320k) ;;
+    wmv)         aflags=(-c:a wmav2 -b:a 320k) ;;
+  esac
+
+  local filter_flags=()
+  if [[ -n "$CROP_W" ]]; then
+    local probe=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 "$INPUT")
+    local src_w=${probe%%,*} src_h=${probe##*,}
+    calc_crop "$src_w" "$src_h" "$CROP_W" "$CROP_H"
+    filter_flags+=(-vf "crop=${CALC_CROP_W}:${CALC_CROP_H}")
+  fi
+
+  echo -e "${CYAN}ffmpeg${RESET} → $OUT_EXT"
+  ffmpeg -loglevel warning -stats -i "$INPUT" "${vflags[@]}" "${filter_flags[@]}" "${aflags[@]}" "$OUTPUT" -y
+}
+
+convert_video_audio() {
+  require_tool ffmpeg ffmpeg
+  local flags=(${=:-$(audio_flags "$OUT_EXT" "$MAX_QUALITY")})
+  echo -e "${CYAN}ffmpeg${RESET} → $OUT_EXT (extract audio)"
+  ffmpeg -loglevel warning -stats -i "$INPUT" -vn "${flags[@]}" "$OUTPUT" -y
+}
+
+convert_pdf_image() {
+  require_tool magick imagemagick
+  local density=200
+  [[ "$MAX_QUALITY" -eq 1 ]] && density=600
+
+  local out_dir out_base
+  out_dir="$(dirname -- "$OUTPUT")"
+  out_base="$(basename -- "$OUTPUT")"
+  out_base="${out_base%.*}"
+  local out_pattern="${out_dir}/${out_base}-%03d.${OUT_EXT}"
+
+  echo -e "${CYAN}magick${RESET} → $OUT_EXT (pdf pages)"
+  magick -density "$density" "$INPUT" "$out_pattern"
+
+  local count=0
+  for f in "${out_dir}/${out_base}"-*.${OUT_EXT}; do
+    [[ -f "$f" ]] && count=$((count + 1))
+  done
+  echo -e "${GREEN}✓${RESET} $count page(s) exported"
+  return 0
+}
+
+convert_image_pdf() {
+  require_tool magick imagemagick
+  echo -e "${CYAN}magick${RESET} → pdf"
+  magick "$INPUT" "$OUTPUT"
+}
+
+convert_doc() {
+  require_tool pandoc pandoc
+  local flags=()
+
+  if [[ "$OUT_EXT" == "pdf" ]]; then
+    if command -v weasyprint &>/dev/null; then
+      flags+=(--pdf-engine=weasyprint)
+    elif command -v xelatex &>/dev/null; then
+      flags+=(--pdf-engine=xelatex)
+    else
+      die "pdf output requires weasyprint or xelatex. Install with: pip install weasyprint"
+    fi
+  fi
+
+  echo -e "${CYAN}pandoc${RESET} → $OUT_EXT"
+  pandoc "$INPUT" -o "$OUTPUT" "${flags[@]}"
+}
+
+# --- Convert one file ---
+convert_one() {
+  INPUT="$1"
+  local output_arg="$2"
+
+  [[ -f "$INPUT" ]] || die "file not found: $INPUT"
+
+  OUTPUT="$(resolve_output "$output_arg" "$INPUT")"
+
+  IN_EXT="$(get_ext "$INPUT")"
+  OUT_EXT="$(get_ext "$OUTPUT")"
+
+  IN_CAT="${EXT_CATEGORY[$IN_EXT]}"
+  OUT_CAT="${EXT_CATEGORY[$OUT_EXT]}"
+
+  [[ -n "$IN_CAT" ]] || die "unsupported input format: .$IN_EXT"
+  [[ -n "$OUT_CAT" ]] || die "unsupported output format: .$OUT_EXT"
+
+  if [[ -n "$RATE_MODE" && "$IN_CAT" != "video" ]]; then
+    die "--cbr/--vbr only applies to video files (got: .$IN_EXT)"
+  fi
+
+  if [[ -n "$CROP_W" && "$IN_CAT" != "image" && "$IN_CAT" != "video" ]]; then
+    die "--crop only applies to image/video files (got: .$IN_EXT)"
+  fi
+
+  local route="${IN_CAT}:${OUT_CAT}"
+
+  case "$route" in
+    audio:audio) convert_audio_audio ;;
+    image:image) convert_image_image ;;
+    video:video) convert_video_video ;;
+    video:audio) convert_video_audio ;;
+    pdf:image)   convert_pdf_image ;;
+    image:pdf)   convert_image_pdf ;;
+    pdf:doc)     convert_doc ;;
+    doc:pdf)     convert_doc ;;
+    doc:doc)     convert_doc ;;
+    *) die "unsupported conversion: $IN_CAT ($IN_EXT) → $OUT_CAT ($OUT_EXT)" ;;
+  esac
+
+  if [[ "$route" != "pdf:image" && -f "$OUTPUT" ]]; then
+    local out_size=$(du -h "$OUTPUT" | awk '{print $1}')
+    echo -e "${GREEN}✓${RESET} $(basename "$OUTPUT") (${out_size})"
+  elif [[ "$route" != "pdf:image" && ! -f "$OUTPUT" ]]; then
+    die "conversion failed — no output file created"
+  fi
+}
+
+# --- Main ---
+
+if [[ "$BATCH_MODE" -eq 1 ]]; then
+  from_ext="${BATCH_FROM_EXT#.}"
+  from_ext="${from_ext:l}"
+  to_ext="${BATCH_TO_EXT}"
+
+  [[ -d "$BATCH_DIR" ]] || die "directory not found: $BATCH_DIR"
+
+  files=("${BATCH_DIR}"/*.${from_ext}(N))
+  [[ ${#files[@]} -gt 0 ]] || die "no .${from_ext} files found in ${BATCH_DIR}"
+
+  echo -e "${CYAN}batch${RESET} ${#files[@]} .${from_ext} file(s) → ${to_ext}"
+  echo ""
+
+  count=0
+  failed=0
+  for f in "${files[@]}"; do
+    if convert_one "$f" "$to_ext"; then
+      count=$((count + 1))
+    else
+      failed=$((failed + 1))
+    fi
+  done
+
+  echo ""
+  echo -e "${GREEN}✓${RESET} ${count} converted"
+  [[ "$failed" -gt 0 ]] && echo -e "${RED}✗${RESET} ${failed} failed"
+elif [[ "$SAME_FMT" -eq 1 ]]; then
+  convert_one "${POSITIONAL[1]}" ".$(get_ext "${POSITIONAL[1]}")"
+else
+  [[ ${#POSITIONAL[@]} -eq 2 ]] || die "expected: <input> <output|ext>  or  [dir] <from_ext> <to_ext>"
+  convert_one "${POSITIONAL[1]}" "${POSITIONAL[2]}"
+fi
