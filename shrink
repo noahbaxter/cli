@@ -2,12 +2,13 @@
 # Compress files for sharing with quality tiers
 # Supports: audio (WAV, MP3, FLAC, OGG, M4A, AAC, etc), video (MP4, MOV, MKV, AVI, etc), images (JPEG, PNG, GIF, WEBP, etc), PDF
 # Philosophy: maximize quality while staying under size target (default 10MB)
-# Usage: shrink [--limit MB] [--vorbis] [--dry-run] <file1> [file2] ... or shrink *.wav
+# Usage: shrink [--limit MB] [--resolution 480] [--vorbis] [--dry-run] <file1> [file2] ... or shrink *.wav
 
 # Default settings
 TARGET_MB=10
 USE_VORBIS=0
 DRY_RUN=0
+RESOLUTION=""
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -23,6 +24,13 @@ while [[ $# -gt 0 ]]; do
     --dry-run)
       DRY_RUN=1
       shift
+      ;;
+    --resolution|-r)
+      case "$2" in
+        1080|720|480|360) RESOLUTION="$2" ;;
+        *) echo "Unknown resolution: $2 (supported: 1080, 720, 480, 360)"; exit 1 ;;
+      esac
+      shift 2
       ;;
     -*)
       echo "Unknown flag: $1"
@@ -284,10 +292,17 @@ compress_video() {
     return
   fi
 
-  # Pick resolution based on video bitrate
+  # Pick resolution based on video bitrate (or user override)
   local scale="1920:-2"
   local label="1080p"
-  if [ "$video_bitrate" -lt 300 ]; then
+  if [ -n "$RESOLUTION" ]; then
+    case "$RESOLUTION" in
+      1080) scale="1920:-2"; label="1080p" ;;
+      720)  scale="1280:-2"; label="720p" ;;
+      480)  scale="854:-2";  label="480p" ;;
+      360)  scale="640:-2";  label="360p" ;;
+    esac
+  elif [ "$video_bitrate" -lt 300 ]; then
     scale="640:-2"
     label="360p"
   elif [ "$video_bitrate" -lt 600 ]; then
