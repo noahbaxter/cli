@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VIDEOS_ROOT="/Volumes/terramox/Videos"
+
+usage() {
+    cat <<'EOF'
+Usage: yt-grab <category> [options] <url>
+
+Download and organize YouTube videos into a Plex-compatible library.
+
+Categories:
+  skate       Skate videos (prompts for part/full)
+  concert     Concert footage
+  <any>       Creates Videos/<Category>/ automatically
+
+Options:
+  -t, --type        Subcategory (skate: "part" or "full", default: part)
+  --creator         Creator name (skater, company, artist)
+  --title           Video title
+  --year            Release year
+  --dry-run         Show what would happen without downloading
+  -h, --help        Show this help
+
+Supported sources: YouTube, Vimeo, and any yt-dlp supported site, plus SkateHype.
+
+Examples:
+  yt-grab skate "https://youtube.com/watch?v=..."
+  yt-grab skate -t full --creator "Girl" "https://youtube.com/watch?v=..."
+  yt-grab skate "https://www.skatehype.com/v/10491/pretty-sweet-girlchocolate-2012"
+  yt-grab concert --creator "Radiohead" "https://youtube.com/watch?v=..."
+EOF
+    exit 0
+}
+
+# --- Argument parsing ---
+CATEGORY="" TYPE="" CREATOR="" TITLE="" YEAR="" DRY_RUN=false URL=""
+
+# First positional arg is category
+if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+    CATEGORY="$1"; shift
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -t|--type)     TYPE="$2"; shift 2 ;;
+        --creator)     CREATOR="$2"; shift 2 ;;
+        --title)       TITLE="$2"; shift 2 ;;
+        --year)        YEAR="$2"; shift 2 ;;
+        --dry-run)     DRY_RUN=true; shift ;;
+        -h|--help)     usage ;;
+        -*)            echo "Unknown option: $1" >&2; exit 1 ;;
+        *)             URL="$1"; shift ;;
+    esac
+done
+
+if [[ -z "$CATEGORY" ]]; then
+    echo "Error: category required" >&2
+    echo "Usage: yt-grab <category> <url>" >&2
+    exit 1
+fi
+
+if [[ -z "$URL" ]]; then
+    echo "Error: URL required" >&2
+    echo "Usage: yt-grab <category> <url>" >&2
+    exit 1
+fi
+
+# --- Preflight ---
+if [[ ! -d "$VIDEOS_ROOT" ]]; then
+    echo "Error: $VIDEOS_ROOT not found — is terramox mounted?" >&2
+    exit 1
+fi
+
+# --- Source detection ---
+IS_SKATEHYPE=false
+if [[ "$URL" =~ skatehype\.com/v/([0-9]+) ]]; then
+    IS_SKATEHYPE=true
+    SH_ID="${BASH_REMATCH[1]}"
+fi
+
+if ! $IS_SKATEHYPE; then
+    for cmd in yt-dlp ffmpeg; do
+        if ! command -v "$cmd" &>/dev/null; then
+            echo "Error: $cmd not found in PATH" >&2
+            exit 1
+        fi
+    done
+fi
+
+# --- Fetch metadata ---
+echo "Fetching metadata..."
+
+if $IS_SKATEHYPE; then
+    # SkateHype: scrape metadata from page JSON-LD and player iframe
+    PAGE_HTML=$(curl -sL "$URL")
+    PLAYER_HTML=$(curl -sL "https://www.skatehype.com/ifplay.php?v=${SH_ID}")
+
+    YT_TITLE=$(echo "$PAGE_HTML" | sed -n 's/.*<title>\([^<]*\)<\/title>.*/\1/p' | head -1)
+    # JSON-LD has "name":"Title" — grab the first one (the video name)
+    YT_CHANNEL=$(echo "$PAGE_HTML" | grep -oE '"author":\{[^}]*"name":"[^"]*"' | head -1 | sed 's/.*"name":"\([^"]*\)".*/\1/')
+    YT_DATE=$(echo "$PAGE_HTML" | grep -oE '"uploadDate":"[^"]*"' | head -1 | sed 's/.*"\([0-9]\{4\}\).*/\1/')
+    SH_THUMB=$(echo "$PAGE_HTML" | grep -oE '"thumbnailUrl":"[^"]*"' | head -1 | sed 's/"thumbnailUrl":"//;s/"//')
+
+    # Extract direct video URL from player <video> tag
+    SH_VIDEO_URL=$(echo "$PLAYER_HTML" | grep -oE "src='https://www\.skatehype\.com/s/v/[^']*\.mp4[^']*'" | head -1 | sed "s/src='//;s/'//")
+
+    # Try HD variant first
+    SH_HD_URL=$(echo "$SH_VIDEO_URL" | sed 's/\.sd\.mp4/.hd.mp4/')
+    if curl -sI "$SH_HD_URL" 2>/dev/null | head -1 | grep -q "200"; then
+        SH_VIDEO_URL="$SH_HD_URL"
+        echo "  (HD available)"
+    fi
+
+    if [[ -z "$SH_VIDEO_URL" ]]; then
+        echo "Error: could not find video URL on SkateHype page" >&2
+        exit 1
+    fi
+else
+    YTDLP_ARGS=(--dump-json --no-download --no-playlist)
+    # Use browser cookies to avoid YouTube bot detection
+    YTDLP_ARGS+=(--cookies-from-browser "firefox:~/Library/Application Support/zen/Profiles/jegj90c1.Default (release)")
+    # Retry with backoff — YouTube rate-limits aggressively
+    YTDLP_ARGS+=(--retry-sleep extractor:30)
+
+    if ! META=$(yt-dlp "${YTDLP_ARGS[@]}" "$URL" 2>&1); then
+        echo "Error: yt-dlp failed to fetch metadata:" >&2
+        echo "$META" >&2
+        exit 1
+    fi
+
+    YT_TITLE=$(echo "$META" | python3 -c "import sys,json; print(json.load(sys.stdin).get('title',''))")
+    YT_CHANNEL=$(echo "$META" | python3 -c "import sys,json; print(json.load(sys.stdin).get('channel','') or json.load(sys.stdin).get('uploader',''))" 2>/dev/null || echo "")
+    YT_DATE=$(echo "$META" | python3 -c "import sys,json; print(json.load(sys.stdin).get('upload_date','')[:4])" 2>/dev/null || echo "")
+fi
+
+echo ""
+echo "  Title:   $YT_TITLE"
+echo "  Channel: $YT_CHANNEL"
+echo "  Year:    $YT_DATE"
+echo ""
+
+# --- Interactive prompts ---
+prompt() {
+    local var_name="$1" prompt_text="$2" default="$3"
+    if [[ -n "${!var_name}" ]]; then return; fi
+    read -rp "$prompt_text [$default]: " input
+    if [[ -n "$input" ]]; then
+        eval "$var_name=\$input"
+    else
+        eval "$var_name=\$default"
+    fi
+}
+
+# Category-specific prompts
+case "$CATEGORY" in
+    skate)
+        if [[ -z "$TYPE" ]]; then
+            read -rp "Type (part/full) [part]: " input
+            TYPE="${input:-part}"
+        fi
+        case "$TYPE" in
+            part) prompt CREATOR "Skater" "$YT_CHANNEL" ;;
+            full) prompt CREATOR "Company" "$YT_CHANNEL" ;;
+            *)    echo "Error: type must be 'part' or 'full'" >&2; exit 1 ;;
+        esac
+        ;;
+    *)
+        prompt CREATOR "Creator/Artist" "$YT_CHANNEL"
+        ;;
+esac
+
+prompt TITLE "Title" "$YT_TITLE"
+prompt YEAR "Year" "$YT_DATE"
+
+# --- Sanitize for filesystem ---
+sanitize() {
+    echo "$1" | sed 's/[:\\/\?\*"<>|]//g' | sed 's/  */ /g' | sed 's/^ *//;s/ *$//'
+}
+
+CREATOR=$(sanitize "$CREATOR")
+TITLE=$(sanitize "$TITLE")
+CLEAN_NAME="(${YEAR}) ${CREATOR} - ${TITLE}"
+
+# --- Build output path ---
+case "$CATEGORY" in
+    skate)
+        if [[ "$TYPE" == "full" ]]; then
+            BASE_DIR="${VIDEOS_ROOT}/Skate/Full Lengths"
+        else
+            BASE_DIR="${VIDEOS_ROOT}/Skate/Parts"
+        fi
+        ;;
+    concert)
+        BASE_DIR="${VIDEOS_ROOT}/Concerts"
+        ;;
+    *)
+        # Capitalize first letter
+        CAT_DIR="$(echo "${CATEGORY:0:1}" | tr '[:lower:]' '[:upper:]')${CATEGORY:1}"
+        BASE_DIR="${VIDEOS_ROOT}/${CAT_DIR}"
+        ;;
+esac
+
+OUTPUT_DIR="${BASE_DIR}/${CLEAN_NAME}"
+
+if $IS_SKATEHYPE; then
+    EXT="mp4"
+else
+    EXT="mkv"
+fi
+
+echo ""
+echo "  Output: ${OUTPUT_DIR}/"
+echo "  File:   ${CLEAN_NAME}.${EXT}"
+echo ""
+
+# Check for existing
+if [[ -d "$OUTPUT_DIR" ]]; then
+    echo "Warning: output directory already exists" >&2
+    read -rp "Overwrite? (y/N): " confirm
+    if [[ "$confirm" != [yY] ]]; then
+        echo "Aborted."
+        exit 0
+    fi
+fi
+
+if $DRY_RUN; then
+    echo "[dry-run] Would download to: ${OUTPUT_DIR}/"
+    exit 0
+fi
+
+# --- Download ---
+mkdir -p "$OUTPUT_DIR"
+
+echo "Downloading..."
+
+if $IS_SKATEHYPE; then
+    # Direct download via curl
+    curl -L --progress-bar \
+        -o "${OUTPUT_DIR}/${CLEAN_NAME}.mp4" \
+        "$SH_VIDEO_URL"
+
+    # Download thumbnail as poster
+    if [[ -n "${SH_THUMB:-}" ]]; then
+        curl -sL -o "${OUTPUT_DIR}/poster.webp" "$SH_THUMB"
+        if command -v ffmpeg &>/dev/null; then
+            ffmpeg -y -loglevel quiet -i "${OUTPUT_DIR}/poster.webp" "${OUTPUT_DIR}/poster.jpg"
+            rm -f "${OUTPUT_DIR}/poster.webp"
+        else
+            # Keep webp if no ffmpeg
+            mv "${OUTPUT_DIR}/poster.webp" "${OUTPUT_DIR}/poster.jpg" 2>/dev/null || true
+        fi
+    fi
+else
+    yt-dlp \
+        -f "bestvideo+bestaudio/best" \
+        --merge-output-format mkv \
+        --write-info-json \
+        --write-thumbnail \
+        --convert-thumbnails jpg \
+        --embed-metadata \
+        --embed-chapters \
+        --no-playlist \
+        --cookies-from-browser "firefox:~/Library/Application Support/zen/Profiles/jegj90c1.Default (release)" \
+        --retry-sleep extractor:30 \
+        -o "${OUTPUT_DIR}/${CLEAN_NAME}.%(ext)s" \
+        --output "thumbnail:${OUTPUT_DIR}/poster" \
+        "$URL"
+fi
+
+# --- Verify ---
+echo ""
+if ls "${OUTPUT_DIR}"/*.${EXT} &>/dev/null; then
+    SIZE=$(du -sh "${OUTPUT_DIR}"/*.${EXT} | cut -f1)
+    echo "Done: ${CLEAN_NAME}.${EXT} (${SIZE})"
+else
+    echo "Warning: no .${EXT} file found in output directory" >&2
+fi
+
+if [[ -f "${OUTPUT_DIR}/poster.jpg" ]]; then
+    echo "Poster: poster.jpg"
+else
+    echo "Warning: poster.jpg not found" >&2
+fi
+
+echo "Path: ${OUTPUT_DIR}/"
