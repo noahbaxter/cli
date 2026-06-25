@@ -1,0 +1,252 @@
+#!/bin/zsh
+# Universal archive extractor
+# Usage: extract <file>
+
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+CYAN='\033[36m'
+RESET='\033[0m'
+
+die() { echo -e "${RED}error:${RESET} $1" >&2; exit 1; }
+
+require_tool() {
+  command -v "$1" &>/dev/null || die "$1 not found. Install with: ${CYAN}brew install $2${RESET}"
+}
+
+show_help() {
+  cat <<'EOF'
+Usage: extract <file>
+
+Extracts archives using the best tool for the format.
+If the archive contains a single top-level directory, it extracts
+directly to cwd. Otherwise, it creates a directory named after the archive.
+
+Supported formats:
+  zip jar war ear    tar tar.gz tgz tar.bz2 tbz2 tar.xz txz tar.zst
+  gz bz2 xz zst     rar 7z iso pkg dmg deb rpm cab exe cpio lz lz4
+
+Examples:
+  extract archive.tar.gz
+  extract photos.zip
+  extract disk.iso
+  extract package.pkg
+EOF
+  exit 0
+}
+
+[[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]] && show_help
+[[ $# -eq 1 ]] || die "expected exactly one argument"
+[[ -f "$1" ]] || die "file not found: $1"
+
+ARCHIVE="${1:A}"
+ARCHIVE_NAME="${ARCHIVE:t}"
+ARCHIVE_LOWER="${ARCHIVE_NAME:l}"
+
+# Detect extension and compute stem (basename without extension)
+case "$ARCHIVE_LOWER" in
+  *.tar.gz)  EXT=tar.gz  ; STEM="${ARCHIVE_NAME[1,-8]}" ;;
+  *.tar.bz2) EXT=tar.bz2 ; STEM="${ARCHIVE_NAME[1,-9]}" ;;
+  *.tar.xz)  EXT=tar.xz  ; STEM="${ARCHIVE_NAME[1,-8]}" ;;
+  *.tar.zst) EXT=tar.zst ; STEM="${ARCHIVE_NAME[1,-9]}" ;;
+  *.tgz)     EXT=tar.gz  ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.tbz2)    EXT=tar.bz2 ; STEM="${ARCHIVE_NAME[1,-6]}" ;;
+  *.txz)     EXT=tar.xz  ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.tar)     EXT=tar     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.zip)     EXT=zip     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.rar)     EXT=rar     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.7z)      EXT=7z      ; STEM="${ARCHIVE_NAME[1,-4]}" ;;
+  *.gz)      EXT=gz      ; STEM="${ARCHIVE_NAME[1,-4]}" ;;
+  *.bz2)     EXT=bz2     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.xz)      EXT=xz      ; STEM="${ARCHIVE_NAME[1,-4]}" ;;
+  *.zst)     EXT=zst     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.lz)      EXT=lz      ; STEM="${ARCHIVE_NAME[1,-4]}" ;;
+  *.lz4)     EXT=lz4     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.iso)     EXT=iso     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.pkg)     EXT=pkg     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.dmg)     EXT=dmg     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.deb)     EXT=deb     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.rpm)     EXT=rpm     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.cab)     EXT=cab     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.exe)     EXT=exe     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.jar)     EXT=jar     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.war)     EXT=war     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.ear)     EXT=ear     ; STEM="${ARCHIVE_NAME[1,-5]}" ;;
+  *.cpio)    EXT=cpio    ; STEM="${ARCHIVE_NAME[1,-6]}" ;;
+  *)         die "unsupported format: $ARCHIVE_NAME" ;;
+esac
+
+# --- Standalone compressors: decompress to cwd, no directory logic ---
+case "$EXT" in
+  gz)
+    require_tool gunzip gunzip
+    OUTPUT="${STEM}"
+    [[ -e "$OUTPUT" ]] && die "'$OUTPUT' already exists"
+    echo -e "${CYAN}gunzip${RESET} $ARCHIVE_NAME"
+    gunzip -c "$ARCHIVE" > "$OUTPUT"
+    echo -e "${GREEN}extracted${RESET} → $OUTPUT"
+    exit 0
+    ;;
+  bz2)
+    require_tool bunzip2 bzip2
+    OUTPUT="${STEM}"
+    [[ -e "$OUTPUT" ]] && die "'$OUTPUT' already exists"
+    echo -e "${CYAN}bunzip2${RESET} $ARCHIVE_NAME"
+    bunzip2 -c "$ARCHIVE" > "$OUTPUT"
+    echo -e "${GREEN}extracted${RESET} → $OUTPUT"
+    exit 0
+    ;;
+  xz)
+    require_tool unxz xz
+    OUTPUT="${STEM}"
+    [[ -e "$OUTPUT" ]] && die "'$OUTPUT' already exists"
+    echo -e "${CYAN}unxz${RESET} $ARCHIVE_NAME"
+    unxz -c "$ARCHIVE" > "$OUTPUT"
+    echo -e "${GREEN}extracted${RESET} → $OUTPUT"
+    exit 0
+    ;;
+  zst)
+    require_tool zstd zstd
+    OUTPUT="${STEM}"
+    [[ -e "$OUTPUT" ]] && die "'$OUTPUT' already exists"
+    echo -e "${CYAN}unzstd${RESET} $ARCHIVE_NAME"
+    zstd -dqc "$ARCHIVE" > "$OUTPUT"
+    echo -e "${GREEN}extracted${RESET} → $OUTPUT"
+    exit 0
+    ;;
+  lz)
+    require_tool lzip lzip
+    OUTPUT="${STEM}"
+    [[ -e "$OUTPUT" ]] && die "'$OUTPUT' already exists"
+    echo -e "${CYAN}lzip${RESET} $ARCHIVE_NAME"
+    lzip -dc "$ARCHIVE" > "$OUTPUT"
+    echo -e "${GREEN}extracted${RESET} → $OUTPUT"
+    exit 0
+    ;;
+  lz4)
+    require_tool lz4 lz4
+    OUTPUT="${STEM}"
+    [[ -e "$OUTPUT" ]] && die "'$OUTPUT' already exists"
+    echo -e "${CYAN}lz4${RESET} $ARCHIVE_NAME"
+    lz4 -dc "$ARCHIVE" > "$OUTPUT"
+    echo -e "${GREEN}extracted${RESET} → $OUTPUT"
+    exit 0
+    ;;
+esac
+
+# --- Archive formats: smart directory extraction ---
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+echo -e "${CYAN}extracting${RESET} $ARCHIVE_NAME"
+
+(
+  cd "$TMPDIR" || exit 1
+  case "$EXT" in
+    zip|jar|war|ear)
+      require_tool unzip unzip
+      unzip -q "$ARCHIVE"
+      ;;
+    tar)
+      tar xf "$ARCHIVE"
+      ;;
+    tar.gz)
+      tar xzf "$ARCHIVE"
+      ;;
+    tar.bz2)
+      tar xjf "$ARCHIVE"
+      ;;
+    tar.xz)
+      tar xJf "$ARCHIVE"
+      ;;
+    tar.zst)
+      require_tool zstd zstd
+      zstd -d < "$ARCHIVE" | tar xf -
+      ;;
+    rar)
+      if command -v unrar &>/dev/null; then
+        unrar x -o+ -idq "$ARCHIVE"
+      elif command -v 7z &>/dev/null; then
+        7z x -y "$ARCHIVE" > /dev/null
+      else
+        die "unrar or 7z not found. Install with: ${CYAN}brew install unrar${RESET}"
+      fi
+      ;;
+    7z|exe)
+      require_tool 7z 7-zip
+      7z x -y "$ARCHIVE" > /dev/null
+      ;;
+    iso)
+      if [[ "$(uname)" == "Darwin" ]]; then
+        MOUNT_POINT=$(mktemp -d)
+        hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$ARCHIVE" > /dev/null
+        cp -R "$MOUNT_POINT"/ .
+        hdiutil detach "$MOUNT_POINT" > /dev/null 2>&1
+        rmdir "$MOUNT_POINT" 2>/dev/null
+      else
+        require_tool 7z 7-zip
+        7z x -y "$ARCHIVE" > /dev/null
+      fi
+      ;;
+    pkg)
+      require_tool pkgutil pkgutil
+      pkgutil --expand "$ARCHIVE" .
+      ;;
+    dmg)
+      if [[ "$(uname)" != "Darwin" ]]; then
+        require_tool 7z 7-zip
+        7z x -y "$ARCHIVE" > /dev/null
+      else
+        MOUNT_POINT=$(mktemp -d)
+        hdiutil attach -nobrowse -readonly -mountpoint "$MOUNT_POINT" "$ARCHIVE" > /dev/null
+        cp -R "$MOUNT_POINT"/ .
+        hdiutil detach "$MOUNT_POINT" > /dev/null 2>&1
+        rmdir "$MOUNT_POINT" 2>/dev/null
+      fi
+      ;;
+    deb)
+      if command -v dpkg-deb &>/dev/null; then
+        dpkg-deb -x "$ARCHIVE" .
+      elif command -v ar &>/dev/null; then
+        ar x "$ARCHIVE"
+      else
+        die "dpkg-deb or ar not found"
+      fi
+      ;;
+    rpm)
+      require_tool rpm2cpio rpm2cpio
+      rpm2cpio "$ARCHIVE" | cpio -idm 2>/dev/null
+      ;;
+    cab)
+      require_tool cabextract cabextract
+      cabextract -q "$ARCHIVE"
+      ;;
+    cpio)
+      cpio -idm < "$ARCHIVE" 2>/dev/null
+      ;;
+  esac
+) || die "extraction failed"
+
+# Smart directory placement
+entries=("$TMPDIR"/*(N))
+count=${#entries[@]}
+
+if [[ $count -eq 0 ]]; then
+  die "extraction produced no files"
+fi
+
+if [[ $count -eq 1 && -d "${entries[1]}" ]]; then
+  # Single top-level directory — move it directly to cwd
+  DEST="${entries[1]:t}"
+  [[ -e "$DEST" ]] && die "'$DEST' already exists"
+  mv "${entries[1]}" .
+  NUM_FILES=$(find "$DEST" -type f | wc -l | tr -d ' ')
+  echo -e "${GREEN}extracted${RESET} → $DEST/ ($NUM_FILES files)"
+else
+  # Multiple entries — wrap in a directory named after the archive
+  [[ -e "$STEM" ]] && die "'$STEM' already exists"
+  mv "$TMPDIR" "$STEM"
+  trap - EXIT
+  NUM_FILES=$(find "$STEM" -type f | wc -l | tr -d ' ')
+  echo -e "${GREEN}extracted${RESET} → $STEM/ ($NUM_FILES files)"
+fi
