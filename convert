@@ -194,6 +194,7 @@ get_ext() {
   local ext="${f##*.}"
   ext="${ext:l}"
   [[ "$ext" == "jpeg" ]] && ext="jpg"
+  [[ "$ext" == "tif" ]] && ext="tiff"
   echo "$ext"
 }
 
