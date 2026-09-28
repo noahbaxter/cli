@@ -1,0 +1,160 @@
+#!/bin/zsh
+# Kill whatever is listening on a port
+# Only targets listeners (TCP LISTEN, bound UDP), never clients connected to the port, so your browser survives
+# Sends SIGTERM, waits up to 3s, then SIGKILL for anything still alive
+# Usage: killport [-y] [-9] [-n] <port> [port2] ...
+
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RED='\033[31m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+FORCE=0
+DRY_RUN=0
+YES=0
+
+usage() {
+  echo "Usage: killport [-y] [-9] [-n] <port> [port2] ..."
+  echo "  -y, -f  kill without asking"
+  echo "  -9      skip SIGTERM, SIGKILL immediately"
+  echo "  -n      dry run, just show what owns the port"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|-f|--yes|--force) YES=1; shift ;;
+    -9) FORCE=1; shift ;;
+    -n|--dry-run) DRY_RUN=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    -*) echo "Unknown flag: $1"; usage; exit 1 ;;
+    *) break ;;
+  esac
+done
+
+if [ -z "$1" ]; then
+  usage
+  exit 1
+fi
+
+listeners() {
+  { lsof -nP -t -iTCP:"$1" -sTCP:LISTEN; lsof -nP -t -iUDP:"$1"; } 2>/dev/null | sort -u
+}
+
+# ps etime is [[dd-]hh:]mm:ss, turn it into 3d4h / 2h13m / 5m / 12s
+uptime_of() {
+  local t=$(ps -o etime= -p "$1" | tr -d ' ')
+  local d=0 h=0 m=0 s
+  [[ $t == *-* ]] && { d=${t%%-*}; t=${t#*-}; }
+  local parts=(${(s.:.)t})
+  s=${parts[-1]}; m=${parts[-2]:-0}; (( ${#parts} == 3 )) && h=${parts[1]}
+  d=$((10#$d)) h=$((10#$h)) m=$((10#$m)) s=$((10#$s))
+  if (( d )); then echo "${d}d${h}h"
+  elif (( h )); then echo "${h}h${m}m"
+  elif (( m )); then echo "${m}m"
+  else echo "${s}s"
+  fi
+}
+
+# Boxed summary of one listener: what it is, where it runs from, who can reach it
+describe() {
+  local port=$1 pid=$2
+  local exe=$(ps -o comm= -p "$pid") cmd=$(ps -o command= -p "$pid") owner=$(ps -o user= -p "$pid")
+  local cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+  local addr=$(lsof -nP -a -p "$pid" -i :"$port" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
+
+  # Apps get their bundle name (Discord, not "Discord Helper (Renderer) --type=renderer ..."),
+  # everything else gets binary basename plus args. Homebrew Python hides a .app inside its
+  # .framework, which is still a CLI
+  local what
+  if [[ $exe == *.app/* && ${exe%%.app/*} != *.framework/* ]]; then
+    local app=${${exe%%.app/*}:t}
+    what=$app
+    [[ ${exe:t} != $app && ${exe:t:l} != ${app:l} ]] && what+=" (${exe:t})"
+  else
+    what="${exe:t}${cmd#$exe}"
+  fi
+
+  local reach
+  case "${addr%:*}" in
+    127.0.0.1|\[::1\]|localhost) reach="localhost only" ;;
+    \*|0.0.0.0|\[::\]) reach="open to network" ;;
+    *) reach="on ${addr%:*}" ;;
+  esac
+
+  local info="pid $pid · up $(uptime_of "$pid") · $reach"
+  [[ $owner != $USER ]] && info+=" · user $owner"
+
+  local rows=("$what" "$info") colors=("" "$DIM")
+  [[ -n $cwd && $cwd != / ]] && { rows+=("${cwd/#$HOME/~}"); colors+=("$DIM"); }
+  [[ $exe == /System/* || $exe == /usr/libexec/* || $exe == /usr/sbin/* ]] && {
+    rows+=("⚠ macOS system process"); colors+=("$YELLOW"); }
+
+  local cols=$COLUMNS
+  (( cols > 0 )) || cols=$(tput cols 2>/dev/null)
+  (( cols > 0 )) || cols=80
+  local max=$(( cols - 4 ))
+  local w=0 i
+  for i in {1..${#rows}}; do
+    (( ${#rows[i]} > max )) && rows[i]="${rows[i][1,max-1]}…"
+    (( ${#rows[i]} > w )) && w=${#rows[i]}
+  done
+  local title=" :$port "
+  (( w < ${#title} + 1 )) && w=$(( ${#title} + 1 ))
+
+  echo "╭─${title}${(l:w-${#title}+1::─:)}╮"
+  for i in {1..${#rows}}; do
+    echo -e "│ ${colors[i]}${(r:w:)rows[i]}${RESET} │"
+  done
+  echo "╰${(l:w+2::─:)}╯"
+}
+
+rc=0
+
+for port in "$@"; do
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    echo -e "${RED}✗${RESET} not a port: $port"
+    rc=1
+    continue
+  fi
+
+  pids=($(listeners "$port"))
+  if [ ${#pids} -eq 0 ]; then
+    echo -e "${DIM}:$port nothing listening${RESET}"
+    continue
+  fi
+
+  for pid in $pids; do describe "$port" "$pid"; done
+
+  [ $DRY_RUN -eq 1 ] && continue
+
+  if [ $YES -eq 0 ]; then
+    read -q "?Kill? [y/N] " < /dev/tty
+    answer=$?
+    echo
+    [ $answer -ne 0 ] && continue
+  fi
+
+  if [ $FORCE -eq 1 ]; then
+    kill -9 $pids 2>/dev/null
+  else
+    kill $pids 2>/dev/null
+    for _ in {1..30}; do
+      alive=()
+      for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive+=("$pid"); done
+      [ ${#alive} -eq 0 ] && break
+      sleep 0.1
+    done
+    [ ${#alive} -gt 0 ] && kill -9 $alive 2>/dev/null
+  fi
+
+  sleep 0.1
+  if [ -n "$(listeners "$port")" ]; then
+    echo -e "${RED}✗${RESET} :$port still in use (owned by another user? try sudo)"
+    rc=1
+  else
+    echo -e "${GREEN}✓${RESET} :$port freed"
+  fi
+done
+
+exit $rc
